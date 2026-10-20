@@ -17,4 +17,12 @@ constexpr unsigned long long operator""ui64(unsigned long long value) {
 // declare `__nop`.
 inline void __nop() {}
 
+// UI Automation's TreeScope enum is spelled `TreeScope_Subtree` in the SDK
+// MSVC builds against, but newer mingw-w64 headers renamed it to
+// `TreeScope_SubTree`. Normalise so src/uia.cc keeps the MSVC spelling.
+#include <uiautomationclient.h>
+#if defined(TreeScope_SubTree) && !defined(TreeScope_Subtree)
+#define TreeScope_Subtree TreeScope_SubTree
+#endif
+
 #endif  // __GNUC__

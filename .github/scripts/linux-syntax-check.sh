@@ -24,6 +24,21 @@ if ! command -v "$cxx" >/dev/null 2>&1; then
   exit 1
 fi
 
+# src/utils.cc uses `std::ranges::to` (C++23), which GCC only implements from
+# 14 on. Without this probe an older runner fails inside the standard library
+# and looks like a source bug. CMakeLists.txt requires MSVC anyway, so demand
+# the same C++23 surface here instead of weakening the check.
+#
+# `-dumpversion` is unusable here: mingw-w64 prints e.g. `14-win32`, so the
+# major version is read from the preprocessor instead.
+gcc_major="$("$cxx" -dM -E - </dev/null 2>/dev/null |
+  awk '$2 == "__GNUC__" { print $3 }')"
+if [[ ! "$gcc_major" =~ ^[0-9]+$ ]] || ((gcc_major < 14)); then
+  echo "error: $cxx reports GCC ${gcc_major:-<unknown>}; chrome++ needs C++23" >&2
+  echo "std::ranges::to (GCC 14+). hint: run this on ubuntu-26.04 (or newer)." >&2
+  exit 1
+fi
+
 for dep in detours/src/detours.h mini_gzip/mini_gzip.h; do
   if [[ ! -f "$dep" ]]; then
     echo "error: $dep missing -- run: git submodule update --init --recursive" >&2

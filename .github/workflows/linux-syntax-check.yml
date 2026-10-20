@@ -39,7 +39,11 @@ permissions:
 jobs:
   syntax-check:
     name: MinGW syntax check
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: src/utils.cc needs C++23
+    # std::ranges::to (GCC 14+), while ubuntu-latest is Ubuntu 24.04 whose
+    # GCC 13 lacks it. 26.04 is the oldest image with a new enough compiler,
+    # and pinning keeps the check from flipping as `latest` moves.
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
