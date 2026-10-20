@@ -37,3 +37,12 @@
 #define __inout_opt
 #define __in_bcount_opt(_size)
 #define __out_bcount_opt(_size)
+
+// MSVC's `0x...ui64` integer suffix (used in the enum just below these
+// includes). GCC accepts it through the user-defined literal in mingw-shim.h,
+// but clang parses the suffix before overload resolution and rejects it, so
+// neutralise it textually instead. Safe here because every header green.cc
+// includes was already parsed above -- the macro cannot reach a system header.
+#ifdef __clang__
+#define ui64
+#endif

@@ -1,10 +1,10 @@
-# Fast feedback on Linux: MinGW-GCC syntax check over every translation unit.
+# Fast feedback on Linux: syntax check over every translation unit.
 #
 # Complements build.yml rather than replacing it. build.yml is the real gate
 # (MSVC/clang-cl on windows-2025, three architectures, produces version.dll)
 # but it needs a Windows runner. This job catches the common case -- a source
-# file that no longer parses -- in about half a minute on a Linux runner, so
-# typos and merge damage fail immediately instead of after the Windows matrix.
+# file that no longer parses -- in about half a minute, so typos and merge
+# damage fail immediately instead of after the Windows matrix.
 #
 # Scope: `-fsyntax-only` only. No codegen, no linking, no MSVC-specific
 # diagnostics. A green run here does NOT prove the Windows build passes.
@@ -38,11 +38,8 @@ permissions:
 
 jobs:
   syntax-check:
-    name: MinGW syntax check
-    # Pinned rather than ubuntu-latest: src/utils.cc needs C++23
-    # std::ranges::to, which the cross compiler on ubuntu-24.04 (GCC 13) does
-    # not have. Pinning keeps the check from flipping as `latest` moves.
-    runs-on: ubuntu-26.04
+    name: Syntax check
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -50,15 +47,16 @@ jobs:
         with:
           submodules: 'true'
 
-      - name: Install MinGW-w64 cross compiler
-        # The `-posix` variant tracks current GCC (16.x on this image); the
-        # plain g++-mingw-w64-x86-64 package is still GCC 13, which lacks the
-        # C++23 std::ranges::to that src/utils.cc uses. The script
-        # feature-tests the compiler and explains this if it is too old.
+      - name: Install cross compilers
+        # clang is the primary frontend: the mingw-w64 cross GCC on the runner
+        # is 13.x, too old for the C++23 std::ranges::to in src/utils.cc, while
+        # clang's standard library has it. GCC is kept for src/green.cc, whose
+        # MSVC `0x1ui64` literal clang cannot parse at all. The script probes
+        # both for the capability it needs and explains any mismatch.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++-mingw-w64-x86-64-posix
+            clang g++-mingw-w64-x86-64
 
       - name: Syntax check sources
         run: .github/scripts/linux-syntax-check.sh
