@@ -24,18 +24,26 @@ if ! command -v "$cxx" >/dev/null 2>&1; then
   exit 1
 fi
 
-# src/utils.cc uses `std::ranges::to` (C++23), which GCC only implements from
-# 14 on. Without this probe an older runner fails inside the standard library
-# and looks like a source bug. CMakeLists.txt requires MSVC anyway, so demand
-# the same C++23 surface here instead of weakening the check.
-#
-# `-dumpversion` is unusable here: mingw-w64 prints e.g. `14-win32`, so the
-# major version is read from the preprocessor instead.
-gcc_major="$("$cxx" -dM -E - </dev/null 2>/dev/null |
-  awk '$2 == "__GNUC__" { print $3 }')"
-if [[ ! "$gcc_major" =~ ^[0-9]+$ ]] || ((gcc_major < 14)); then
-  echo "error: $cxx reports GCC ${gcc_major:-<unknown>}; chrome++ needs C++23" >&2
-  echo "std::ranges::to (GCC 14+). hint: run this on ubuntu-26.04 (or newer)." >&2
+# src/utils.cc uses `std::ranges::to` (C++23). GCC only gained it in 14 while
+# the Debian/Ubuntu mingw-w64 cross package still ships GCC 13 even on Ubuntu
+# 26.04, so probing by version is wrong in both directions. Feature-test the
+# compiler directly: if `std::ranges::to` parses, the toolchain is adequate.
+probe="$(mktemp -d)"
+shim_dir="$(mktemp -d)"
+trap 'rm -rf "$probe" "$shim_dir"' EXIT
+cat >"$probe/ranges_to.cc" <<'CPP'
+#include <ranges>
+#include <vector>
+int main() {
+  std::vector<int> values{1, 2};
+  auto result = values | std::ranges::to<std::vector>();
+  (void)result;
+}
+CPP
+if ! "$cxx" -std=c++23 -fsyntax-only "$probe/ranges_to.cc" >/dev/null 2>&1; then
+  echo "error: $cxx cannot compile C++23 std::ranges::to, which src/utils.cc uses." >&2
+  echo "hint: install a newer cross compiler, e.g." >&2
+  echo "      sudo apt-get install g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix" >&2
   exit 1
 fi
 
@@ -45,9 +53,6 @@ for dep in detours/src/detours.h mini_gzip/mini_gzip.h; do
     exit 1
   fi
 done
-
-shim_dir="$(mktemp -d)"
-trap 'rm -rf "$shim_dir"' EXIT
 
 cp .github/msvc-compat/*.h "$shim_dir/"
 
