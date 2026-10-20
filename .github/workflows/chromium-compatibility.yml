@@ -1,0 +1,106 @@
+# Early warning: does chrome++ still match the Chromium source it hooks?
+#
+# chrome++ binds to Chrome internals that upstream can rename without notice:
+# UIA class names (src/uia.cc), the strings it patches into resources.pak
+# (src/pakpatch.cc) and the installer version format the upgrade notification
+# reads (src/upgradenotification.cc). A rename does not fail any build -- the
+# feature just silently stops working on the next Chrome release.
+#
+# This job re-checks every anchor against the current Chromium Stable tag and
+# opens (or updates) one issue when something drifted, so the break is known
+# before users hit it.
+name: Chromium Compatibility
+
+on:
+  schedule:
+    # Mondays 06:17 UTC -- right after Chrome's weekly Stable roll.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Chromium tag to check (default: current Stable)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  anchors:
+    name: Check anchors against Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Resolve Chromium Stable version
+        id: chromium
+        run: .github/scripts/chromium-stable-version.sh --github-output
+
+      - name: Choose tag under test
+        id: target
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          STABLE_TAG: ${{ steps.chromium.outputs.TAG }}
+          STABLE_VERSION: ${{ steps.chromium.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$STABLE_TAG}"
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == "$STABLE_TAG" ]]; then
+            echo "Checking the current Stable tag ($TAG, Stable $STABLE_VERSION)"
+          else
+            echo "Checking the requested tag ($TAG); current Stable is $STABLE_TAG"
+          fi
+
+      - name: Check anchors
+        id: check
+        run: |
+          set -euo pipefail
+          .github/scripts/check-chromium-anchors.sh "${{ steps.target.outputs.TAG }}" \
+            > anchors.txt || true
+          cat anchors.txt
+          {
+            echo "## Chromium compatibility: ${{ steps.target.outputs.TAG }}"
+            echo
+            echo '```'
+            cat anchors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Exits non-zero on drift, but still writes the full JSON report.
+          .github/scripts/check-chromium-anchors.sh "${{ steps.target.outputs.TAG }}" \
+            --json > anchors.json || true
+          cat anchors.json
+
+      - name: Report drift
+        id: drift
+        run: .github/scripts/render-drift-issue.py >> "$GITHUB_OUTPUT"
+
+      - name: Open or update issue
+        if: steps.drift.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_TITLE: "Chromium compatibility: anchors drifted in ${{ steps.target.outputs.TAG }}"
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --limit 100 --json number,title \
+            --jq ".[] | select(.title == env.ISSUE_TITLE) | .number" | head -1)"
+          if [[ -n "$existing" ]]; then
+            echo "Updating issue #$existing"
+            gh issue comment "$existing" --body-file issue_body.md
+          else
+            echo "Opening a new issue"
+            gh issue create --title "$ISSUE_TITLE" --body-file issue_body.md
+          fi
+
+      - name: Fail when anchors drifted
+        if: steps.drift.outputs.count != '0'
+        run: |
+          echo "::error::${{ steps.drift.outputs.count }} Chromium anchor(s) drifted in ${{ steps.target.outputs.TAG }}"
+          exit 1

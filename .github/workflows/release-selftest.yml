@@ -1,0 +1,225 @@
+# Self-test for the release pipeline, and the diagnosis when it cannot run.
+#
+# `build.yml`'s create_pr job and `release.yml` both depend on the repo secret
+# TOKEN (a PAT with `workflow` + `repo` scope). Without it the release flow
+# fails late, deep inside `gh pr create`, with an error that does not say what
+# to configure. This workflow answers two questions up front:
+#
+#   1. Is TOKEN configured, and does it actually work?
+#   2. If I bump the version through the real path, does the pipeline hold?
+#
+# Nothing here mutates the repo unless the pipeline is confirmed healthy and
+# `apply` is explicitly requested.
+name: Release Pipeline Self-Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to test the bump with (e.g. 1.19.0). Leave empty to only validate configuration.'
+        required: false
+        default: ''
+      apply:
+        description: 'Actually push the release branch and open the PR (requires a working TOKEN)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Diagnose release configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      token_ok: ${{ steps.token.outputs.ok }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check TOKEN secret
+        id: token
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TOKEN:-}" ]]; then
+            ok=false
+            {
+              echo "### TOKEN secret is not configured"
+              echo
+              echo "The release flow cannot open a PR without it. To enable it:"
+              echo
+              echo '1. Create a fine-grained PAT with **Contents: read and write**'
+              echo '   and **Pull requests: read and write** for this repository'
+              echo '   (a classic PAT with `repo` + `workflow` also works).'
+              echo '2. Add it as a repository secret named `TOKEN`:'
+              echo '   *Settings → Secrets and variables → Actions → New repository secret*.'
+              echo '3. Re-run this workflow to verify.'
+              echo
+              echo "Until then, \`build.yml\` and \`release.yml\` will fail at the"
+              echo "\`create_pr\` / PR step; building and running the other checks is unaffected."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=$ok" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate the token rather than trusting its presence: a revoked or
+          # under-scoped PAT fails much later otherwise.
+          status="$(curl -s -o /tmp/user.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/${{ github.repository }})"
+          if [[ "$status" != "200" ]]; then
+            echo "::warning::TOKEN is set but GitHub returned HTTP $status for ${{ github.repository }}"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          login="$(python3 -c 'import json;print(json.load(open("/tmp/user.json"))["full_name"])')"
+          echo "TOKEN authenticates against $login"
+          {
+            echo "### TOKEN is configured and valid"
+            echo
+            echo "- Repository: \`$login\`"
+            echo "- HTTP status: \`$status\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check version.h format
+        id: version
+        run: |
+          set -euo pipefail
+          get_define() {
+            awk -v name="$1" '
+              $1 == "#define" && $2 == name { v = $3; gsub(/"/, "", v); print v; found = 1; exit }
+              END { if (!found) exit 1 }
+            ' src/version.h
+          }
+          MAJOR="$(get_define RELEASE_VER_MAIN)"
+          MINOR="$(get_define RELEASE_VER_SUB)"
+          PATCH="$(get_define RELEASE_VER_FIX)"
+          PRE="$(get_define RELEASE_VER_PRE_SUFFIX)"
+          VERSION="$MAJOR.$MINOR.$PATCH$PRE"
+          echo "Current version.h: $VERSION"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::src/version.h does not form a valid SemVer ('$VERSION')"
+            exit 1
+          fi
+          echo "current=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run the release bump
+        if: inputs.version != ''
+        run: |
+          set -euo pipefail
+          REQUESTED="${{ inputs.version }}"
+          if [[ ! "$REQUESTED" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::'$REQUESTED' is not SemVer (expected e.g. 1.19.0 or 1.19.0-alpha.1)"
+            exit 1
+          fi
+
+          # Mirror the sed edits build.yml performs, on a throwaway copy, so a
+          # mismatch in version.h's shape is caught here instead of in create_pr.
+          cp src/version.h /tmp/version.h.orig
+          CORE="${REQUESTED%%-*}"
+          PRE="${REQUESTED#*-}"
+          if [[ "$PRE" == "$REQUESTED" ]]; then PRE_SUFFIX=""; else PRE_SUFFIX="-$PRE"; fi
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$CORE"
+          sed -i "s/#define RELEASE_VER_MAIN .*/#define RELEASE_VER_MAIN $MAJOR/" src/version.h
+          sed -i "s/#define RELEASE_VER_SUB .*/#define RELEASE_VER_SUB $MINOR/" src/version.h
+          sed -i "s/#define RELEASE_VER_FIX .*/#define RELEASE_VER_FIX $PATCH/" src/version.h
+          sed -i "s|#define RELEASE_VER_PRE_SUFFIX .*|#define RELEASE_VER_PRE_SUFFIX \"$PRE_SUFFIX\"|" src/version.h
+
+          if diff -q /tmp/version.h.orig src/version.h >/dev/null; then
+            echo "::error::the version bump changed nothing -- sed patterns no longer match src/version.h"
+            exit 1
+          fi
+          echo "Bump would produce:"
+          grep -E '^#define RELEASE_VER_(MAIN|SUB|FIX|PRE_SUFFIX)' src/version.h
+          git checkout -- src/version.h
+
+      - name: Summary
+        run: |
+          {
+            echo
+            echo "| check | result |"
+            echo "| --- | --- |"
+            echo "| TOKEN secret | ${{ steps.token.outputs.ok == 'true' && 'ok' || '**missing or invalid**' }} |"
+            echo "| version.h | \`${{ steps.version.outputs.current }}\` (valid SemVer) |"
+            if [[ -n "${{ inputs.version }}" ]]; then
+              echo "| bump dry-run | \`${{ inputs.version }}\` applies cleanly |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Bump version and open PR
+    needs: diagnose
+    if: inputs.apply && inputs.version != '' && needs.diagnose.outputs.token_ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure git
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          git config user.name "$ACTOR"
+          git config user.email "${ACTOR}@users.noreply.github.com"
+
+      - name: Bump version.h on a release branch
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::'$VERSION' is not SemVer"
+            exit 1
+          fi
+          CORE="${VERSION%%-*}"
+          PRE="${VERSION#*-}"
+          if [[ "$PRE" == "$VERSION" ]]; then PRE_SUFFIX=""; else PRE_SUFFIX="-$PRE"; fi
+          IFS='.' read -r MAJOR MINOR PATCH <<<"$CORE"
+          sed -i "s/#define RELEASE_VER_MAIN .*/#define RELEASE_VER_MAIN $MAJOR/" src/version.h
+          sed -i "s/#define RELEASE_VER_SUB .*/#define RELEASE_VER_SUB $MINOR/" src/version.h
+          sed -i "s/#define RELEASE_VER_FIX .*/#define RELEASE_VER_FIX $PATCH/" src/version.h
+          sed -i "s|#define RELEASE_VER_PRE_SUFFIX .*|#define RELEASE_VER_PRE_SUFFIX \"$PRE_SUFFIX\"|" src/version.h
+          git checkout -b release
+          git add src/version.h
+          git commit -m "build(release): bump version to $VERSION"
+
+      - name: Push release branch
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin \
+            "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin release --force
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if gh pr list --head release --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "A release PR already exists; branch updated in place."
+            exit 0
+          fi
+          gh pr create \
+            --base main \
+            --head release \
+            --title "build(release): bump version to $VERSION" \
+            --body "Version bump created by the Release Pipeline Self-Test workflow.
+
+          Merging this triggers \`release.yml\`, which tags \`$VERSION\`, downloads
+          the matching \`Build\` run artifacts and publishes the release."

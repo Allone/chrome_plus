@@ -1,0 +1,61 @@
+# Fast feedback on Linux: MinGW-GCC syntax check over every translation unit.
+#
+# Complements build.yml rather than replacing it. build.yml is the real gate
+# (MSVC/clang-cl on windows-2025, three architectures, produces version.dll)
+# but it needs a Windows runner. This job catches the common case -- a source
+# file that no longer parses -- in well under a minute on ubuntu-latest, so
+# typos and merge damage fail immediately instead of after the Windows matrix.
+#
+# Scope: `-fsyntax-only` only. No codegen, no linking, no MSVC-specific
+# diagnostics. A green run here does NOT prove the Windows build passes.
+name: Linux Syntax Check
+
+on:
+  push:
+    paths:
+      - 'src/**.cc'
+      - 'src/**.h'
+      - '.github/workflows/**.yml'
+      - '.github/scripts/**.sh'
+      - '.github/scripts/**.py'
+      - '.github/msvc-compat/**.h'
+  pull_request:
+    paths:
+      - 'src/**.cc'
+      - 'src/**.h'
+      - '.github/workflows/**.yml'
+      - '.github/scripts/**.sh'
+      - '.github/scripts/**.py'
+      - '.github/msvc-compat/**.h'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    name: MinGW syntax check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+
+      - name: Install MinGW-w64 cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64
+
+      - name: Syntax check sources
+        run: .github/scripts/linux-syntax-check.sh
+
+      - name: Lint workflow YAML and shell
+        run: |
+          sudo apt-get install -y --no-install-recommends python3-yaml
+          python3 .github/scripts/lint-workflow-shell.py
