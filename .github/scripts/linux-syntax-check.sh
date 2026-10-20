@@ -70,6 +70,18 @@ if "$cxx" -std=c++23 -fsyntax-only "$probe/ranges_to.cc" >/dev/null 2>&1; then
   have_ranges_to=true
 fi
 
+# Which spelling does this SDK's TreeScope enum use? The members are enum
+# values, so the shim cannot detect this itself (see mingw-shim.h) and the
+# answer is passed in as a define instead.
+cat >"$probe/treescope.cc" <<'CPP'
+#include <uiautomationclient.h>
+int main() { return TreeScope_Subtree; }
+CPP
+treescope_flags=()
+if ! "$cxx" -std=c++23 -fsyntax-only "$probe/treescope.cc" >/dev/null 2>&1; then
+  treescope_flags=(-DMSVC_TREESCOPE_ALIAS)
+fi
+
 flags=(
   -std=c++23
   -fsyntax-only
@@ -80,6 +92,7 @@ flags=(
   -Imini_gzip
   -iquote "$shim_dir"
   -include "$shim_dir/mingw-shim.h"
+  "${treescope_flags[@]}"
   # The shim's `operator"" ui64` trips GCC's reserved-suffix pedantry.
   -Wno-literal-suffix
 )

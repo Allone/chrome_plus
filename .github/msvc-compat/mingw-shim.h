@@ -20,10 +20,19 @@ constexpr unsigned long long operator"" ui64(unsigned long long value) {
 inline void __nop() {}
 
 // UI Automation's TreeScope enum is spelled `TreeScope_Subtree` in the SDK
-// MSVC builds against, but newer mingw-w64 headers renamed it to
-// `TreeScope_SubTree`. Normalise so src/uia.cc keeps the MSVC spelling.
+// MSVC builds against, but newer mingw-w64 headers renamed the member to
+// `TreeScope_SubTree`. Normalise the MSVC spelling so src/uia.cc compiles
+// unchanged.
+//
+// These are enum *members*, not macros, so the preprocessor cannot detect
+// which spelling the SDK uses: `defined()` never sees them, and defining the
+// macro unconditionally would rewrite the member inside the header itself.
+// The script therefore probes the SDK and passes MSVC_TREESCOPE_ALIAS, and
+// the macro is only defined after the header has been parsed.
+//
+// Kept in sync with the probe in .github/scripts/linux-syntax-check.sh.
 #include <uiautomationclient.h>
-#if defined(TreeScope_SubTree) && !defined(TreeScope_Subtree)
+#if defined(MSVC_TREESCOPE_ALIAS) && defined(__GNUC__)
 #define TreeScope_Subtree TreeScope_SubTree
 #endif
 
