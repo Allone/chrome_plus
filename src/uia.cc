@@ -46,6 +46,11 @@ struct CachedClassConditions {
   ComPtr<IUIAutomationCondition> bookmark_button;
   ComPtr<IUIAutomationCondition> menu_item_view;
   ComPtr<IUIAutomationCondition> tab_strip_control_button;
+  // `chrome/browser/ui/views/tabs/shared/new_tab_button.h`. The pre-unification
+  // `NewTabButton` declares no metadata of its own, so UIA reports it under its
+  // `TabStripControlButton` base class; the shared one used by the unified
+  // strip does declare metadata and reports `NewTabButton`.
+  ComPtr<IUIAutomationCondition> new_tab_button;
 };
 
 enum class TabContainerKind {
@@ -54,8 +59,10 @@ enum class TabContainerKind {
   // Chrome 152 rebuilt the vertical strip on the unified TabCollectionNode
   // system (chrome/browser/ui/views/tabs/common/tab_strip_view.h): the
   // container is `UnpinnedTabContainerView` and tabs are `TabView`. The
-  // horizontal strip moves to the same classes once
-  // `tabs::kTabStripUnification` ships enabled.
+  // horizontal strip builds the same subtree once `tabs::kTabStripUnification`
+  // ships enabled (`CreateHorizontalTabStripRegionView` then returns
+  // `HorizontalTabStripRegionViewNew` and no `TabStrip`/`TabContainerImpl` is
+  // created), so both orientations share this kind.
   kUnified,
 };
 
@@ -152,7 +159,9 @@ bool InitializeClassConditions(UiaSession* session) {
          CreateClassCondition(session->automation, L"MenuItemView",
                               &conditions.menu_item_view) &&
          CreateClassCondition(session->automation, L"TabStripControlButton",
-                              &conditions.tab_strip_control_button);
+                              &conditions.tab_strip_control_button) &&
+         CreateClassCondition(session->automation, L"NewTabButton",
+                              &conditions.new_tab_button);
 }
 
 UiaSession* GetUiaSession() {
@@ -677,6 +686,20 @@ std::optional<TabContainer> FindTabContainerInRegion(
           region, session.class_conditions.tab_container_impl)) {
     return TabContainer{container, TabContainerKind::kHorizontal};
   }
+
+  // Unified horizontal strip (`tabs::kTabStripUnification`, flagged in every
+  // release since Chrome 152): `CreateHorizontalTabStripRegionView` returns
+  // `HorizontalTabStripRegionViewNew` and no `TabStrip` is created at all, so
+  // neither `TabStrip::TabDragContextImpl` nor `TabContainerImpl` exists. The
+  // subtree mirrors the vertical case -- `TabStripView ▸ ScrollView ▸
+  // Viewport ▸ UnpinnedTabContainerView ▸ TabView` -- so resolve it exactly
+  // like the vertical unified strip. Anchoring on the unpinned container
+  // keeps pinned tabs out of hit-testing and counts, matching both
+  // orientations.
+  if (const auto container = FindFirstDescendantByClass(
+          region, session.class_conditions.unpinned_tab_container_view)) {
+    return TabContainer{container, TabContainerKind::kUnified};
+  }
   return std::nullopt;
 }
 
@@ -703,16 +726,16 @@ TabUiCache* ResolveTabUi(UiaSession* session, HWND hwnd) {
   }
 
   // Chrome 152 renamed `HorizontalTabStripRegionView` to
-  // `HorizontalTabStripRegionViewOld` and put a rewritten
+  // `HorizontalTabStripRegionViewOld` and introduced
   // `HorizontalTabStripRegionViewNew` behind `tabs::kTabStripUnification`
   // (crrev.com/c/7963961, chrome/browser/ui/views/frame/
-  // horizontal_tab_strip_region_view.h). Match the pre-152 and `Old` names;
-  // the flagged `New` view hosts a different subtree (TabCollectionNode) and
-  // needs its own container resolution once it ships enabled.
+  // horizontal_tab_strip_region_view.h). Match the pre-152 `Old` name and the
+  // flagged `New` one; the latter hosts the unified TabCollectionNode subtree
+  // and is resolved through `FindTabContainerInRegion`.
   auto region = FindShallowDescendantByClasses(
       session->control_view_walker.Get(), window_element,
       {L"HorizontalTabStripRegionView", L"HorizontalTabStripRegionViewOld",
-       L"VerticalTabStripRegionView"},
+       L"HorizontalTabStripRegionViewNew", L"VerticalTabStripRegionView"},
       /*max_visited=*/256);
   if (!region && !fullscreen &&
       FindShallowDescendantByClasses(session->control_view_walker.Get(),
@@ -731,7 +754,7 @@ TabUiCache* ResolveTabUi(UiaSession* session, HWND hwnd) {
     region = FindShallowDescendantByClasses(
         session->control_view_walker.Get(), browser_view,
         {L"HorizontalTabStripRegionView", L"HorizontalTabStripRegionViewOld",
-         L"VerticalTabStripRegionView"},
+         L"HorizontalTabStripRegionViewNew", L"VerticalTabStripRegionView"},
         /*max_visited=*/256);
     if (!region) {
       DebugLog(L"UIA: recovered BrowserView has no tab strip region");
@@ -955,11 +978,12 @@ std::optional<TabHitResult> BuildTabHitResult(const UiaSession& session,
   return hit_result;
 }
 
-// `region` is the tab strip region: the New Tab `TabStripControlButton` sits
-// beside the tab container inside it, and anchoring there keeps the search
-// out of the content branch (a window-root search would cross it, issue
-// #270). A null region (fullscreen raw fallback) skips straight to the
-// user-configured names in the caller.
+// `region` is the tab strip region: the New Tab button (`shared::NewTabButton`
+// or, pre-unification, a metadata-less `NewTabButton` reported as its
+// `TabStripControlButton` base class) sits beside the tab container inside it,
+// and anchoring there keeps the search out of the content branch (a window-root
+// search would cross it, issue #270). A null region (fullscreen raw fallback)
+// skips straight to the user-configured names in the caller.
 std::optional<std::wstring> GetNewTabButtonName(
     const UiaSession& session,
     const ComPtr<IUIAutomationElement>& region) {
@@ -968,8 +992,22 @@ std::optional<std::wstring> GetNewTabButtonName(
     return cached_name;
   }
 
-  const auto button = FindFirstDescendantByClass(
-      region, session.class_conditions.tab_strip_control_button);
+  // Probe the class the unified strip reports first: `shared::NewTabButton`
+  // declares metadata, so UIA names it `NewTabButton` and no other element in
+  // the region can match it -- a reliable anchor for the vertical strip (since
+  // Chrome 152) and for the horizontal one once `tabs::kTabStripUnification`
+  // ships. The pre-unification button declares no metadata of its own and
+  // surfaces as its `TabStripControlButton` base class, which is only claimed
+  // when no `NewTabButton` exists; `TabStripControlButton` cannot lead the
+  // probe because the region also holds unrelated base-classed buttons
+  // (unfocus, scroll) whose names would otherwise be mistaken for the New
+  // Tab button's.
+  auto button = FindFirstDescendantByClass(
+      region, session.class_conditions.new_tab_button);
+  if (!button) {
+    button = FindFirstDescendantByClass(
+        region, session.class_conditions.tab_strip_control_button);
+  }
   if (!button) {
     return std::nullopt;
   }
