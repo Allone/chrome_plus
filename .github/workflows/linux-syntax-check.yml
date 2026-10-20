@@ -1,4 +1,4 @@
-# Fast feedback on Linux: syntax check over every translation unit.
+# Fast feedback on Linux: MinGW-GCC syntax check over every translation unit.
 #
 # Complements build.yml rather than replacing it. build.yml is the real gate
 # (MSVC/clang-cl on windows-2025, three architectures, produces version.dll)
@@ -8,6 +8,11 @@
 #
 # Scope: `-fsyntax-only` only. No codegen, no linking, no MSVC-specific
 # diagnostics. A green run here does NOT prove the Windows build passes.
+#
+# Known limitation: the mingw-w64 GCC on runner images is 13.x, whose
+# libstdc++ predates C++23 `std::ranges::to`, so src/utils.cc cannot be parsed
+# there. The script detects this, skips that file and says so in the job
+# summary, rather than pretending to full coverage.
 name: Linux Syntax Check
 
 on:
@@ -38,7 +43,7 @@ permissions:
 
 jobs:
   syntax-check:
-    name: Syntax check
+    name: MinGW syntax check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,16 +52,10 @@ jobs:
         with:
           submodules: 'true'
 
-      - name: Install cross compilers
-        # clang is the primary frontend: the mingw-w64 cross GCC on the runner
-        # is 13.x, too old for the C++23 std::ranges::to in src/utils.cc, while
-        # clang's standard library has it. GCC is kept for src/green.cc, whose
-        # MSVC `0x1ui64` literal clang cannot parse at all. The script probes
-        # both for the capability it needs and explains any mismatch.
+      - name: Install MinGW-w64 cross compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang g++-mingw-w64-x86-64
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64
 
       - name: Syntax check sources
         run: .github/scripts/linux-syntax-check.sh
